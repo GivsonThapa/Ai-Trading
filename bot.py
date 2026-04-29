@@ -10,7 +10,7 @@ from news_feed import get_news, news_is_risky
 
 load_dotenv()
 
-exchange = ccxt.binance()
+exchange = ccxt.kraken()
 
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -63,7 +63,7 @@ def log_trade(action, price, quantity, reason):
 def run():
     state = get_state()
 
-    data = exchange.fetch_ohlcv("BTC/USDT", timeframe="5m")
+    data = exchange.fetch_ohlcv("BTC/USD", timeframe="5m")
     df = pd.DataFrame(data, columns=["time", "open", "high", "low", "close", "volume"])
     df = add_indicators(df)
 
