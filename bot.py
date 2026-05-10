@@ -4,6 +4,8 @@ from dotenv import load_dotenv
 import csv
 from pathlib import Path
 from datetime import datetime
+import requests
+import os
 
 from indicators import add_indicators
 from news_feed import get_news, news_is_risky
@@ -24,8 +26,30 @@ RISK_PER_TRADE = 0.01
 STOP_LOSS = 0.02
 TAKE_PROFIT = 0.04
 
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+
+def send_telegram(message):
+
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message
+    }
+
+    try:
+        requests.post(url, data=payload, timeout=10)
+    except:
+        pass
+
 
 def get_state():
+
     if not STATE_FILE.exists():
         return {
             "balance": START_BALANCE,
@@ -53,6 +77,7 @@ def get_state():
 
 
 def save_state(state):
+
     with open(STATE_FILE, "w") as f:
         f.write(
             f"{state['balance']},{state['position']},{state['entry_price']}"
@@ -60,9 +85,11 @@ def save_state(state):
 
 
 def log_trade(action, price, quantity, reason):
+
     file_exists = TRADES_FILE.exists()
 
     with open(TRADES_FILE, "a", newline="") as f:
+
         writer = csv.writer(f)
 
         if not file_exists:
@@ -84,9 +111,11 @@ def log_trade(action, price, quantity, reason):
 
 
 def log_decision(signal, price, reason):
+
     file_exists = DECISION_FILE.exists()
 
     with open(DECISION_FILE, "a", newline="") as f:
+
         writer = csv.writer(f)
 
         if not file_exists:
@@ -106,6 +135,7 @@ def log_decision(signal, price, reason):
 
 
 def run():
+
     state = get_state()
 
     data = exchange.fetch_ohlcv(
@@ -128,6 +158,7 @@ def run():
     df = add_indicators(df)
 
     latest = df.iloc[-1]
+
     price = float(latest["close"])
 
     signal = "HOLD"
@@ -137,53 +168,50 @@ def run():
     if state["position"] > 0:
 
         if price <= state["entry_price"] * (1 - STOP_LOSS):
+
             signal = "SELL"
             reason = "Stop loss triggered"
 
         elif price >= state["entry_price"] * (1 + TAKE_PROFIT):
+
             signal = "SELL"
             reason = "Take profit triggered"
 
         else:
+
             signal = "HOLD"
             reason = "Already holding BTC position"
 
-    # New signal generation
     else:
 
         if (
             latest["ema_fast"] > latest["ema_slow"]
             and latest["rsi"] < 70
         ):
+
             signal = "BUY"
             reason = "EMA fast above EMA slow and RSI below 70"
 
         elif latest["ema_fast"] < latest["ema_slow"]:
+
             signal = "SELL"
             reason = "EMA fast below EMA slow"
 
-    # News filter
     news = get_news()
 
     risky_news, risk_word = news_is_risky(news)
 
     if signal == "BUY" and risky_news:
+
         signal = "HOLD"
         reason = f"Risky news detected: {risk_word}"
 
-    # Logging
     log_decision(signal, price, reason)
 
     print("BTC Price:", price)
     print("Signal:", signal)
     print("Reason:", reason)
 
-    print("\nNews headlines:")
-
-    for n in news:
-        print("-", n.get("title", "No title"))
-
-    # Execute BUY
     if signal == "BUY" and state["position"] <= 0:
 
         trade_amount = state["balance"] * RISK_PER_TRADE
@@ -191,7 +219,9 @@ def run():
         quantity = trade_amount / price
 
         state["balance"] -= trade_amount
+
         state["position"] = quantity
+
         state["entry_price"] = price
 
         log_trade(
@@ -201,9 +231,14 @@ def run():
             reason
         )
 
-        print("\nPAPER BUY executed")
+        send_telegram(
+            f"🟢 BUY BTC/USD\\n"
+            f"Price: {price}\\n"
+            f"Reason: {reason}"
+        )
 
-    # Execute SELL
+        print("PAPER BUY executed")
+
     elif signal == "SELL" and state["position"] > 0:
 
         quantity = state["position"]
@@ -213,6 +248,7 @@ def run():
         state["balance"] += sell_value
 
         state["position"] = 0.0
+
         state["entry_price"] = 0.0
 
         log_trade(
@@ -222,10 +258,23 @@ def run():
             reason
         )
 
-        print("\nPAPER SELL executed")
+        send_telegram(
+            f"🔴 SELL BTC/USD\\n"
+            f"Price: {price}\\n"
+            f"Reason: {reason}"
+        )
+
+        print("PAPER SELL executed")
 
     else:
-        print("\nNo paper trade executed")
+
+        send_telegram(
+            f"⚪ HOLD BTC/USD\\n"
+            f"Price: {price}\\n"
+            f"Reason: {reason}"
+        )
+
+        print("No paper trade executed")
 
     total_value = (
         state["balance"]
