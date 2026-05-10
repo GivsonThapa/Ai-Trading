@@ -23,8 +23,11 @@ DECISION_FILE = DATA_DIR / "decision_log.csv"
 
 START_BALANCE = 1000
 RISK_PER_TRADE = 0.01
+
 STOP_LOSS = 0.02
 TAKE_PROFIT = 0.04
+
+COOLDOWN_HOURS = 1
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -54,7 +57,8 @@ def get_state():
         return {
             "balance": START_BALANCE,
             "position": 0.0,
-            "entry_price": 0.0
+            "entry_price": 0.0,
+            "last_trade_time": ""
         }
 
     with open(STATE_FILE, "r") as f:
@@ -64,23 +68,32 @@ def get_state():
         return {
             "balance": START_BALANCE,
             "position": 0.0,
-            "entry_price": 0.0
+            "entry_price": 0.0,
+            "last_trade_time": ""
         }
 
     parts = content.split(",")
 
+    while len(parts) < 4:
+        parts.append("")
+
     return {
         "balance": float(parts[0]),
         "position": float(parts[1]),
-        "entry_price": float(parts[2])
+        "entry_price": float(parts[2]),
+        "last_trade_time": parts[3]
     }
 
 
 def save_state(state):
 
     with open(STATE_FILE, "w") as f:
+
         f.write(
-            f"{state['balance']},{state['position']},{state['entry_price']}"
+            f"{state['balance']},"
+            f"{state['position']},"
+            f"{state['entry_price']},"
+            f"{state['last_trade_time']}"
         )
 
 
@@ -134,10 +147,30 @@ def log_decision(signal, price, reason):
         ])
 
 
+def cooldown_active(last_trade_time):
+
+    if not last_trade_time:
+        return False
+
+    try:
+
+        last_trade = datetime.fromisoformat(last_trade_time)
+
+        hours = (
+            datetime.utcnow() - last_trade
+        ).total_seconds() / 3600
+
+        return hours < COOLDOWN_HOURS
+
+    except:
+        return False
+
+
 def run():
 
     state = get_state()
 
+    # 5m timeframe
     data = exchange.fetch_ohlcv(
         "BTC/USD",
         timeframe="5m"
@@ -157,12 +190,44 @@ def run():
 
     df = add_indicators(df)
 
+    # 1h timeframe trend confirmation
+    higher_data = exchange.fetch_ohlcv(
+        "BTC/USD",
+        timeframe="1h"
+    )
+
+    higher_df = pd.DataFrame(
+        higher_data,
+        columns=[
+            "time",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume"
+        ]
+    )
+
+    higher_df = add_indicators(higher_df)
+
     latest = df.iloc[-1]
+    higher_latest = higher_df.iloc[-1]
 
     price = float(latest["close"])
 
     signal = "HOLD"
     reason = "No clear signal"
+
+    # Average volume filter
+    avg_volume = df["volume"].tail(20).mean()
+
+    volume_ok = latest["volume"] > avg_volume
+
+    # Higher timeframe trend
+    higher_trend_bullish = (
+        higher_latest["ema_fast"]
+        > higher_latest["ema_slow"]
+    )
 
     # Existing position handling
     if state["position"] > 0:
@@ -184,19 +249,31 @@ def run():
 
     else:
 
-        if (
+        if cooldown_active(state["last_trade_time"]):
+
+            signal = "HOLD"
+            reason = "Cooldown active"
+
+        elif (
             latest["ema_fast"] > latest["ema_slow"]
             and latest["rsi"] < 70
+            and volume_ok
+            and higher_trend_bullish
         ):
 
             signal = "BUY"
-            reason = "EMA fast above EMA slow and RSI below 70"
+
+            reason = (
+                "EMA bullish + RSI valid + "
+                "Volume confirmed + 1h trend bullish"
+            )
 
         elif latest["ema_fast"] < latest["ema_slow"]:
 
             signal = "SELL"
-            reason = "EMA fast below EMA slow"
+            reason = "EMA bearish"
 
+    # News filter
     news = get_news()
 
     risky_news, risk_word = news_is_risky(news)
@@ -204,6 +281,7 @@ def run():
     if signal == "BUY" and risky_news:
 
         signal = "HOLD"
+
         reason = f"Risky news detected: {risk_word}"
 
     log_decision(signal, price, reason)
@@ -212,9 +290,13 @@ def run():
     print("Signal:", signal)
     print("Reason:", reason)
 
+    # BUY
     if signal == "BUY" and state["position"] <= 0:
 
-        trade_amount = state["balance"] * RISK_PER_TRADE
+        trade_amount = (
+            state["balance"]
+            * RISK_PER_TRADE
+        )
 
         quantity = trade_amount / price
 
@@ -224,6 +306,10 @@ def run():
 
         state["entry_price"] = price
 
+        state["last_trade_time"] = (
+            datetime.utcnow().isoformat()
+        )
+
         log_trade(
             "BUY",
             price,
@@ -232,13 +318,14 @@ def run():
         )
 
         send_telegram(
-            f"🟢 BUY BTC/USD\\n"
-            f"Price: {price}\\n"
+            f"🟢 BUY BTC/USD\n"
+            f"Price: {price}\n"
             f"Reason: {reason}"
         )
 
         print("PAPER BUY executed")
 
+    # SELL
     elif signal == "SELL" and state["position"] > 0:
 
         quantity = state["position"]
@@ -251,6 +338,10 @@ def run():
 
         state["entry_price"] = 0.0
 
+        state["last_trade_time"] = (
+            datetime.utcnow().isoformat()
+        )
+
         log_trade(
             "SELL",
             price,
@@ -259,20 +350,14 @@ def run():
         )
 
         send_telegram(
-            f"🔴 SELL BTC/USD\\n"
-            f"Price: {price}\\n"
+            f"🔴 SELL BTC/USD\n"
+            f"Price: {price}\n"
             f"Reason: {reason}"
         )
 
         print("PAPER SELL executed")
 
     else:
-
-        send_telegram(
-            f"⚪ HOLD BTC/USD\\n"
-            f"Price: {price}\\n"
-            f"Reason: {reason}"
-        )
 
         print("No paper trade executed")
 
