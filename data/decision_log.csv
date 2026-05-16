@@ -81,3 +81,4 @@ time,signal,price,reason
 2026-05-16 08:57:22.893666,HOLD,78367.2,Already holding BTC position
 2026-05-16 10:16:06.584730,SELL,77893.0,Stop loss triggered
 2026-05-16 11:28:21.218504,SELL,78089.3,EMA bearish
+2026-05-16 12:37:44.181490,SELL,78032.7,EMA bearish
