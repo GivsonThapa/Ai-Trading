@@ -312,3 +312,4 @@ time,signal,price,reason
 2026-06-07 06:19:35.455026,HOLD,61781.9,No clear signal
 2026-06-07 09:42:54.845360,HOLD,62521.3,No clear signal
 2026-06-07 11:27:14.868079,HOLD,62518.0,Risky news detected: lawsuit
+2026-06-07 13:02:30.991593,SELL,61834.1,EMA bearish
