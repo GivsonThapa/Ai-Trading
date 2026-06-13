@@ -373,3 +373,4 @@ time,signal,price,reason
 2026-06-13 17:57:12.558574,HOLD,63918.4,Already holding BTC position
 2026-06-13 19:25:14.462244,HOLD,64156.2,Already holding BTC position
 2026-06-13 20:46:53.762961,HOLD,64217.2,Already holding BTC position
+2026-06-13 21:52:50.229918,SELL,64450.0,Take profit triggered
