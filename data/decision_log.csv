@@ -377,3 +377,4 @@ time,signal,price,reason
 2026-06-13 22:51:31.550465,HOLD,64484.3,Cooldown active
 2026-06-13 23:53:48.405013,HOLD,64378.1,No clear signal
 2026-06-14 02:39:24.367716,HOLD,64526.0,No clear signal
+2026-06-14 07:09:12.794382,SELL,64210.9,EMA bearish
