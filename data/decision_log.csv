@@ -420,3 +420,4 @@ time,signal,price,reason
 2026-06-19 07:24:46.492920,HOLD,62702.6,No clear signal
 2026-06-19 11:45:47.230259,HOLD,62604.1,No clear signal
 2026-06-19 14:30:35.162415,HOLD,63215.2,No clear signal
+2026-06-19 17:00:13.401639,SELL,62939.1,EMA bearish
