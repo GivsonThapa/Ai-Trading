@@ -548,3 +548,4 @@ time,signal,price,reason
 2026-07-01 08:45:37.798190,SELL,58654.5,EMA bearish
 2026-07-01 11:46:18.499061,SELL,58604.9,EMA bearish
 2026-07-01 16:23:00.641295,HOLD,59907.4,Risky news detected: ban
+2026-07-01 18:20:34.925033,HOLD,60081.4,No clear signal
