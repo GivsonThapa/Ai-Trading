@@ -9,3 +9,4 @@ time,action,price,quantity,reason
 2026-05-16 10:16:06.584806,SELL,77893.0,0.0001251474987166596,Stop loss triggered
 2026-06-07 21:36:08.244348,BUY,61777.9,0.0001619228429455017,EMA bullish + RSI valid + Volume confirmed + 1h trend bullish
 2026-06-13 21:52:50.230013,SELL,64450.0,0.0001619228429455017,Take profit triggered
+2026-07-03 13:57:41.504626,BUY,62060.4,0.00016125548561545295,EMA bullish + RSI valid + Volume confirmed + 1h trend bullish
