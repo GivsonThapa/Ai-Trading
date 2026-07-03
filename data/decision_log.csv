@@ -570,3 +570,4 @@ time,signal,price,reason
 2026-07-03 09:47:17.133601,SELL,61712.5,EMA bearish
 2026-07-03 11:56:26.020426,HOLD,61963.4,No clear signal
 2026-07-03 13:57:41.504548,BUY,62060.4,EMA bullish + RSI valid + Volume confirmed + 1h trend bullish
+2026-07-03 15:52:55.285782,HOLD,61844.9,Already holding BTC position
