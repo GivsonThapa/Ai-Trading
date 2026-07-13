@@ -1,39 +1,984 @@
-name: Run Trading Bot
+import ccxt
+import pandas as pd
+from dotenv import load_dotenv
+import csv
+import json
+from pathlib import Path
+from datetime import datetime, timezone
+import requests
+import os
 
-on:
-  schedule:
-    - cron: "*/5 * * * *"
-  workflow_dispatch:
+from indicators import add_indicators
+from news_feed import get_news, news_is_risky
 
-jobs:
-  run-bot:
-    runs-on: ubuntu-latest
 
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+load_dotenv()
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
+exchange = ccxt.kraken({
+    "enableRateLimit": True
+})
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
 
-      - name: Run bot
-        env:
-          NEWSAPI_KEY: ${{ secrets.NEWSAPI_KEY }}
-          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python bot.py
+# =========================================================
+# FILES
+# =========================================================
 
-      - name: Save state
-        run: |
-          mkdir -p data
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/
-          git commit -m "update bot state" || true
-          git push
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
+
+TRADES_FILE = DATA_DIR / "trades.csv"
+STATE_FILE = DATA_DIR / "state.json"
+DECISION_FILE = DATA_DIR / "decision_log.csv"
+
+
+# =========================================================
+# PORTFOLIO CONFIGURATION
+# =========================================================
+
+WATCHLIST = [
+    "ETH/AUD",
+    "SOL/AUD",
+    "BTC/AUD",
+]
+
+START_BALANCE = 200.00
+
+MAX_OPEN_POSITIONS = 1
+MAX_POSITION_PERCENT = 0.70
+
+RISK_PER_TRADE = 0.01
+MIN_SIGNAL_SCORE = 75
+
+STOP_LOSS_PERCENT = 0.01
+TAKE_PROFIT_PERCENT = 0.018
+
+MAX_HOLD_HOURS = 8
+COOLDOWN_HOURS = 1
+
+SHORT_TIMEFRAME = "5m"
+HIGHER_TIMEFRAME = "1h"
+
+CANDLE_LIMIT = 200
+
+
+# =========================================================
+# TELEGRAM
+# =========================================================
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def send_telegram(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    )
+
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+    }
+
+    try:
+        response = requests.post(
+            url,
+            data=payload,
+            timeout=10
+        )
+        response.raise_for_status()
+
+    except requests.RequestException as error:
+        print("Telegram error:", error)
+
+
+# =========================================================
+# STATE MANAGEMENT
+# =========================================================
+
+def default_state():
+    return {
+        "balance": START_BALANCE,
+        "position": None,
+        "last_trade_time": "",
+    }
+
+
+def get_state():
+    if not STATE_FILE.exists():
+        return default_state()
+
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as file:
+            state = json.load(file)
+
+        state.setdefault("balance", START_BALANCE)
+        state.setdefault("position", None)
+        state.setdefault("last_trade_time", "")
+
+        return state
+
+    except (json.JSONDecodeError, OSError, TypeError, ValueError):
+        print("Could not read state file. Using default state.")
+        return default_state()
+
+
+def save_state(state):
+    temporary_file = STATE_FILE.with_suffix(".tmp")
+
+    with open(temporary_file, "w", encoding="utf-8") as file:
+        json.dump(
+            state,
+            file,
+            indent=4
+        )
+
+    temporary_file.replace(STATE_FILE)
+
+
+# =========================================================
+# CSV LOGGING
+# =========================================================
+
+def append_csv(file_path, headers, row):
+    file_exists = file_path.exists()
+
+    with open(
+        file_path,
+        "a",
+        newline="",
+        encoding="utf-8"
+    ) as file:
+
+        writer = csv.writer(file)
+
+        if not file_exists:
+            writer.writerow(headers)
+
+        writer.writerow(row)
+
+
+def log_decision(
+    symbol,
+    signal,
+    price,
+    score,
+    reason
+):
+    append_csv(
+        DECISION_FILE,
+        [
+            "time",
+            "symbol",
+            "signal",
+            "price",
+            "score",
+            "reason",
+        ],
+        [
+            utc_now().isoformat(),
+            symbol,
+            signal,
+            round(price, 8),
+            score,
+            reason,
+        ],
+    )
+
+
+def log_trade(
+    action,
+    symbol,
+    price,
+    quantity,
+    trade_value,
+    reason,
+    entry_price="",
+    pnl="",
+    return_percent=""
+):
+    append_csv(
+        TRADES_FILE,
+        [
+            "time",
+            "action",
+            "symbol",
+            "price",
+            "quantity",
+            "trade_value",
+            "entry_price",
+            "pnl",
+            "return_percent",
+            "reason",
+        ],
+        [
+            utc_now().isoformat(),
+            action,
+            symbol,
+            round(price, 8),
+            round(quantity, 12),
+            round(trade_value, 2),
+            entry_price,
+            pnl,
+            return_percent,
+            reason,
+        ],
+    )
+
+
+# =========================================================
+# MARKET DATA
+# =========================================================
+
+def fetch_dataframe(symbol, timeframe):
+    candles = exchange.fetch_ohlcv(
+        symbol,
+        timeframe=timeframe,
+        limit=CANDLE_LIMIT
+    )
+
+    if not candles:
+        raise ValueError(
+            f"No candle data returned for {symbol}"
+        )
+
+    dataframe = pd.DataFrame(
+        candles,
+        columns=[
+            "time",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+        ],
+    )
+
+    dataframe = add_indicators(dataframe)
+
+    dataframe.dropna(inplace=True)
+
+    if dataframe.empty:
+        raise ValueError(
+            f"Not enough indicator data for {symbol}"
+        )
+
+    return dataframe
+
+
+def get_spread_percent(symbol):
+    try:
+        ticker = exchange.fetch_ticker(symbol)
+
+        bid = ticker.get("bid")
+        ask = ticker.get("ask")
+
+        if not bid or not ask or ask <= 0:
+            return None
+
+        midpoint = (bid + ask) / 2
+
+        return ((ask - bid) / midpoint) * 100
+
+    except ccxt.BaseError:
+        return None
+
+
+# =========================================================
+# SIGNAL SCORING
+# =========================================================
+
+def calculate_signal_score(
+    short_df,
+    higher_df,
+    spread_percent
+):
+    latest = short_df.iloc[-1]
+    higher_latest = higher_df.iloc[-1]
+
+    score = 0
+    reasons = []
+
+    short_bullish = (
+        latest["ema_fast"] > latest["ema_slow"]
+    )
+
+    higher_bullish = (
+        higher_latest["ema_fast"]
+        > higher_latest["ema_slow"]
+    )
+
+    # Trend strength: maximum 30 points
+    if short_bullish and higher_bullish:
+        score += 30
+        reasons.append("5m and 1h trends bullish")
+
+    elif higher_bullish:
+        score += 15
+        reasons.append("1h trend bullish")
+
+    elif short_bullish:
+        score += 10
+        reasons.append("5m trend bullish")
+
+    # Volume confirmation: maximum 25 points
+    average_volume = (
+        short_df["volume"]
+        .tail(20)
+        .mean()
+    )
+
+    volume_ratio = 0
+
+    if average_volume > 0:
+        volume_ratio = (
+            latest["volume"] / average_volume
+        )
+
+    if volume_ratio >= 1.50:
+        score += 25
+        reasons.append("strong volume")
+
+    elif volume_ratio >= 1.20:
+        score += 20
+        reasons.append("volume confirmed")
+
+    elif volume_ratio >= 1.00:
+        score += 10
+        reasons.append("average volume")
+
+    # RSI momentum: maximum 20 points
+    rsi = float(latest["rsi"])
+
+    if 50 <= rsi <= 65:
+        score += 20
+        reasons.append(f"RSI strong ({rsi:.1f})")
+
+    elif 45 <= rsi < 50:
+        score += 12
+        reasons.append(f"RSI improving ({rsi:.1f})")
+
+    elif 65 < rsi < 70:
+        score += 10
+        reasons.append(f"RSI elevated ({rsi:.1f})")
+
+    else:
+        reasons.append(f"RSI unsuitable ({rsi:.1f})")
+
+    # Recent volatility: maximum 15 points
+    recent_high = short_df["high"].tail(20).max()
+    recent_low = short_df["low"].tail(20).min()
+
+    price = float(latest["close"])
+
+    volatility_percent = (
+        (recent_high - recent_low) / price
+    ) * 100
+
+    if 0.50 <= volatility_percent <= 3.00:
+        score += 15
+        reasons.append(
+            f"healthy volatility "
+            f"({volatility_percent:.2f}%)"
+        )
+
+    elif 0.25 <= volatility_percent < 0.50:
+        score += 8
+        reasons.append(
+            f"low volatility "
+            f"({volatility_percent:.2f}%)"
+        )
+
+    elif 3.00 < volatility_percent <= 5.00:
+        score += 5
+        reasons.append(
+            f"high volatility "
+            f"({volatility_percent:.2f}%)"
+        )
+
+    else:
+        reasons.append(
+            f"volatility unsuitable "
+            f"({volatility_percent:.2f}%)"
+        )
+
+    # Spread and liquidity: maximum 10 points
+    if spread_percent is None:
+        score += 5
+        reasons.append("spread unavailable")
+
+    elif spread_percent <= 0.10:
+        score += 10
+        reasons.append(
+            f"tight spread ({spread_percent:.3f}%)"
+        )
+
+    elif spread_percent <= 0.25:
+        score += 7
+        reasons.append(
+            f"acceptable spread "
+            f"({spread_percent:.3f}%)"
+        )
+
+    elif spread_percent <= 0.50:
+        score += 3
+        reasons.append(
+            f"wide spread ({spread_percent:.3f}%)"
+        )
+
+    else:
+        reasons.append(
+            f"spread too wide "
+            f"({spread_percent:.3f}%)"
+        )
+
+    valid_entry = (
+        short_bullish
+        and higher_bullish
+        and rsi < 70
+        and volume_ratio >= 1.00
+        and score >= MIN_SIGNAL_SCORE
+    )
+
+    return {
+        "score": score,
+        "price": price,
+        "rsi": rsi,
+        "volume_ratio": volume_ratio,
+        "short_bullish": short_bullish,
+        "higher_bullish": higher_bullish,
+        "valid_entry": valid_entry,
+        "reason": " + ".join(reasons),
+    }
+
+
+def analyse_symbol(symbol):
+    short_df = fetch_dataframe(
+        symbol,
+        SHORT_TIMEFRAME
+    )
+
+    higher_df = fetch_dataframe(
+        symbol,
+        HIGHER_TIMEFRAME
+    )
+
+    spread_percent = get_spread_percent(symbol)
+
+    result = calculate_signal_score(
+        short_df,
+        higher_df,
+        spread_percent
+    )
+
+    result["symbol"] = symbol
+
+    return result
+
+
+# =========================================================
+# RISK MANAGEMENT
+# =========================================================
+
+def cooldown_active(last_trade_time):
+    if not last_trade_time:
+        return False
+
+    try:
+        last_trade = datetime.fromisoformat(
+            last_trade_time
+        )
+
+        if last_trade.tzinfo is None:
+            last_trade = last_trade.replace(
+                tzinfo=timezone.utc
+            )
+
+        hours_since_trade = (
+            utc_now() - last_trade
+        ).total_seconds() / 3600
+
+        return hours_since_trade < COOLDOWN_HOURS
+
+    except (TypeError, ValueError):
+        return False
+
+
+def position_hold_hours(position):
+    opened_at = position.get("opened_at")
+
+    if not opened_at:
+        return 0
+
+    try:
+        opened_time = datetime.fromisoformat(
+            opened_at
+        )
+
+        if opened_time.tzinfo is None:
+            opened_time = opened_time.replace(
+                tzinfo=timezone.utc
+            )
+
+        return (
+            utc_now() - opened_time
+        ).total_seconds() / 3600
+
+    except (TypeError, ValueError):
+        return 0
+
+
+def calculate_trade_amount(balance):
+    risk_amount = balance * RISK_PER_TRADE
+
+    risk_based_position = (
+        risk_amount / STOP_LOSS_PERCENT
+    )
+
+    maximum_position = (
+        balance * MAX_POSITION_PERCENT
+    )
+
+    trade_amount = min(
+        risk_based_position,
+        maximum_position,
+        balance
+    )
+
+    return round(trade_amount, 2)
+
+
+def order_meets_market_minimum(
+    symbol,
+    quantity,
+    trade_value
+):
+    try:
+        market = exchange.market(symbol)
+
+        limits = market.get("limits", {})
+
+        minimum_amount = (
+            limits.get("amount", {})
+            .get("min")
+        )
+
+        minimum_cost = (
+            limits.get("cost", {})
+            .get("min")
+        )
+
+        if (
+            minimum_amount is not None
+            and quantity < minimum_amount
+        ):
+            return (
+                False,
+                f"Quantity below minimum "
+                f"{minimum_amount}"
+            )
+
+        if (
+            minimum_cost is not None
+            and trade_value < minimum_cost
+        ):
+            return (
+                False,
+                f"Trade value below minimum "
+                f"{minimum_cost}"
+            )
+
+        return True, ""
+
+    except ccxt.BaseError:
+        return True, ""
+
+
+# =========================================================
+# POSITION MANAGEMENT
+# =========================================================
+
+def close_position(
+    state,
+    current_price,
+    reason
+):
+    position = state["position"]
+
+    symbol = position["symbol"]
+    quantity = float(position["quantity"])
+    entry_price = float(position["entry_price"])
+
+    sell_value = quantity * current_price
+    entry_value = quantity * entry_price
+
+    pnl = sell_value - entry_value
+
+    return_percent = (
+        (current_price - entry_price)
+        / entry_price
+    ) * 100
+
+    state["balance"] += sell_value
+    state["position"] = None
+    state["last_trade_time"] = (
+        utc_now().isoformat()
+    )
+
+    log_trade(
+        action="SELL",
+        symbol=symbol,
+        price=current_price,
+        quantity=quantity,
+        trade_value=sell_value,
+        entry_price=round(entry_price, 8),
+        pnl=round(pnl, 2),
+        return_percent=round(return_percent, 3),
+        reason=reason,
+    )
+
+    send_telegram(
+        f"🔴 PAPER SELL {symbol}\n"
+        f"Exit price: {current_price:.4f}\n"
+        f"Return: {return_percent:.2f}%\n"
+        f"P/L: A${pnl:.2f}\n"
+        f"Reason: {reason}"
+    )
+
+    print(f"PAPER SELL executed for {symbol}")
+    print("Profit/loss:", round(pnl, 2))
+
+    return state
+
+
+def manage_open_position(state):
+    position = state["position"]
+
+    symbol = position["symbol"]
+    entry_price = float(position["entry_price"])
+
+    analysis = analyse_symbol(symbol)
+
+    current_price = analysis["price"]
+
+    stop_price = (
+        entry_price
+        * (1 - STOP_LOSS_PERCENT)
+    )
+
+    take_profit_price = (
+        entry_price
+        * (1 + TAKE_PROFIT_PERCENT)
+    )
+
+    hold_hours = position_hold_hours(position)
+
+    signal = "HOLD"
+    reason = f"Managing open {symbol} position"
+
+    if current_price <= stop_price:
+        signal = "SELL"
+        reason = "Stop loss triggered"
+
+    elif current_price >= take_profit_price:
+        signal = "SELL"
+        reason = "Take profit triggered"
+
+    elif hold_hours >= MAX_HOLD_HOURS:
+        signal = "SELL"
+        reason = (
+            f"Maximum holding period reached "
+            f"({hold_hours:.2f} hours)"
+        )
+
+    elif not analysis["higher_bullish"]:
+        signal = "SELL"
+        reason = "1h trend turned bearish"
+
+    elif (
+        not analysis["short_bullish"]
+        and analysis["rsi"] < 45
+    ):
+        signal = "SELL"
+        reason = "5m bearish reversal confirmed"
+
+    log_decision(
+        symbol=symbol,
+        signal=signal,
+        price=current_price,
+        score=analysis["score"],
+        reason=reason,
+    )
+
+    print("\nOpen position:")
+    print("Symbol:", symbol)
+    print("Entry price:", entry_price)
+    print("Current price:", current_price)
+    print("Holding hours:", round(hold_hours, 2))
+    print("Signal:", signal)
+    print("Reason:", reason)
+
+    if signal == "SELL":
+        state = close_position(
+            state,
+            current_price,
+            reason
+        )
+
+    return state, current_price
+
+
+# =========================================================
+# NEW ENTRY SCANNING
+# =========================================================
+
+def scan_watchlist():
+    results = []
+
+    for symbol in WATCHLIST:
+        try:
+            analysis = analyse_symbol(symbol)
+            results.append(analysis)
+
+            signal = (
+                "BUY"
+                if analysis["valid_entry"]
+                else "HOLD"
+            )
+
+            log_decision(
+                symbol=symbol,
+                signal=signal,
+                price=analysis["price"],
+                score=analysis["score"],
+                reason=analysis["reason"],
+            )
+
+            print("\n", symbol)
+            print("Price:", analysis["price"])
+            print("Score:", analysis["score"])
+            print("Valid entry:", analysis["valid_entry"])
+            print("Reason:", analysis["reason"])
+
+        except (
+            ccxt.BaseError,
+            ValueError,
+            KeyError
+        ) as error:
+
+            print(
+                f"Could not analyse {symbol}:",
+                error
+            )
+
+    results.sort(
+        key=lambda item: item["score"],
+        reverse=True
+    )
+
+    return results
+
+
+def open_position(state, opportunity):
+    symbol = opportunity["symbol"]
+    price = opportunity["price"]
+
+    trade_amount = calculate_trade_amount(
+        state["balance"]
+    )
+
+    if trade_amount <= 0:
+        print("No available balance.")
+        return state
+
+    quantity = trade_amount / price
+
+    market_ok, market_reason = (
+        order_meets_market_minimum(
+            symbol,
+            quantity,
+            trade_amount
+        )
+    )
+
+    if not market_ok:
+        print(
+            f"Trade skipped for {symbol}: "
+            f"{market_reason}"
+        )
+
+        log_decision(
+            symbol=symbol,
+            signal="HOLD",
+            price=price,
+            score=opportunity["score"],
+            reason=market_reason,
+        )
+
+        return state
+
+    state["balance"] -= trade_amount
+
+    state["position"] = {
+        "symbol": symbol,
+        "quantity": quantity,
+        "entry_price": price,
+        "trade_value": trade_amount,
+        "opened_at": utc_now().isoformat(),
+        "entry_score": opportunity["score"],
+    }
+
+    state["last_trade_time"] = (
+        utc_now().isoformat()
+    )
+
+    log_trade(
+        action="BUY",
+        symbol=symbol,
+        price=price,
+        quantity=quantity,
+        trade_value=trade_amount,
+        reason=opportunity["reason"],
+    )
+
+    send_telegram(
+        f"🟢 PAPER BUY {symbol}\n"
+        f"Price: {price:.4f}\n"
+        f"Amount: A${trade_amount:.2f}\n"
+        f"Score: {opportunity['score']}/100\n"
+        f"Stop loss: {STOP_LOSS_PERCENT * 100:.1f}%\n"
+        f"Take profit: "
+        f"{TAKE_PROFIT_PERCENT * 100:.1f}%"
+    )
+
+    print("\nPAPER BUY executed")
+    print("Symbol:", symbol)
+    print("Trade amount:", trade_amount)
+    print("Quantity:", quantity)
+
+    return state
+
+
+# =========================================================
+# MAIN BOT
+# =========================================================
+
+def run():
+    exchange.load_markets()
+
+    state = get_state()
+
+    print("=" * 50)
+    print("KRONOS MULTI-COIN PAPER TRADER")
+    print("=" * 50)
+    print("Available balance:", round(state["balance"], 2))
+
+    current_position_price = 0
+
+    # Only manage the existing position when one is open
+    if state["position"] is not None:
+        state, current_position_price = (
+            manage_open_position(state)
+        )
+
+    # Scan for a new trade only when no position is open
+    if state["position"] is None:
+
+        if cooldown_active(
+            state["last_trade_time"]
+        ):
+            print("\nCooldown active. No new entry.")
+
+        else:
+            news = get_news()
+            risky_news, risk_word = (
+                news_is_risky(news)
+            )
+
+            if risky_news:
+                reason = (
+                    f"Risky news detected: {risk_word}"
+                )
+
+                print(reason)
+
+                for symbol in WATCHLIST:
+                    log_decision(
+                        symbol=symbol,
+                        signal="HOLD",
+                        price=0,
+                        score=0,
+                        reason=reason,
+                    )
+
+            else:
+                opportunities = scan_watchlist()
+
+                valid_opportunities = [
+                    item
+                    for item in opportunities
+                    if item["valid_entry"]
+                ]
+
+                if valid_opportunities:
+                    best_opportunity = (
+                        valid_opportunities[0]
+                    )
+
+                    state = open_position(
+                        state,
+                        best_opportunity
+                    )
+
+                else:
+                    print(
+                        "\nNo coin reached the "
+                        f"{MIN_SIGNAL_SCORE} score."
+                    )
+
+    # Calculate portfolio value
+    total_value = state["balance"]
+
+    if state["position"] is not None:
+        symbol = state["position"]["symbol"]
+
+        try:
+            ticker = exchange.fetch_ticker(symbol)
+            position_price = float(ticker["last"])
+
+        except (ccxt.BaseError, TypeError, ValueError):
+            position_price = current_position_price
+
+        total_value += (
+            state["position"]["quantity"]
+            * position_price
+        )
+
+    print("\nPaper account:")
+    print(
+        "Cash balance:",
+        round(state["balance"], 2)
+    )
+
+    print(
+        "Open position:",
+        state["position"]
+    )
+
+    print(
+        "Total portfolio value:",
+        round(total_value, 2)
+    )
+
+    save_state(state)
+
+
+if __name__ == "__main__":
+    run()
