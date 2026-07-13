@@ -694,3 +694,6 @@ time,signal,price,reason
 2026-07-12 22:06:33.628829,HOLD,63673.1,Already holding BTC position
 2026-07-12 23:04:32.116868,HOLD,63759.1,Already holding BTC position
 2026-07-13 00:05:53.625336,HOLD,63965.2,Already holding BTC position
+2026-07-13T02:31:23.954163+00:00,ETH/AUD,HOLD,2605.42,40,1h trend bullish + RSI unsuitable (20.0) + healthy volatility (1.38%) + tight spread (0.041%)
+2026-07-13T02:31:27.362379+00:00,SOL/AUD,HOLD,110.44,25,RSI unsuitable (25.3) + healthy volatility (1.66%) + tight spread (0.045%)
+2026-07-13T02:31:30.758067+00:00,BTC/AUD,HOLD,91491.0,25,RSI unsuitable (32.6) + healthy volatility (1.28%) + tight spread (0.025%)
